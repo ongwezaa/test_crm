@@ -5,7 +5,7 @@ A local-first CRM inspired by monday.com with a Kanban board and table view. Run
 ## Tech stack
 
 - **API:** Node.js + Express + TypeScript
-- **DB:** SQLite (file-based) with automatic migrations
+- **DB:** SQLite (file-based) with automatic migrations (powered by sql.js, no native build tools)
 - **Web:** React + Vite + TypeScript
 - **Monorepo:** workspaces for `/apps/api`, `/apps/web`, `/packages/shared`
 
@@ -50,5 +50,6 @@ Tables are auto-initialized on API boot. See `/apps/api/src/db.ts` for schema an
 ## Notes
 
 - SQLite database is stored at `/apps/api/data/crm.sqlite`.
+- The API uses `sql.js` to avoid native module builds on Windows.
 - Drag and drop on the Deals Board updates stage immediately (optimistic UI).
 - Deals Table supports inline editing for amount, stage, owner, and close date.

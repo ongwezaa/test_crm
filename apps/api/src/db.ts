@@ -1,17 +1,9 @@
-import Database from "better-sqlite3";
-import path from "path";
 import fs from "fs";
+import path from "path";
+import initSqlJs, { Database, SqlValue } from "sql.js";
 
 const dataDir = path.join(__dirname, "..", "data");
 const dbPath = path.join(dataDir, "crm.sqlite");
-
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-export const db = new Database(dbPath);
-
-db.pragma("foreign_keys = ON");
 
 type Migration = {
   id: number;
@@ -118,17 +110,94 @@ const migrations: Migration[] = [
   }
 ];
 
-export const runMigrations = () => {
-  db.prepare("CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))").run();
-  const applied = db
-    .prepare("SELECT id FROM migrations ORDER BY id")
-    .all()
-    .map((row) => row.id as number);
+let db: Database | null = null;
 
+const persist = () => {
+  if (!db) return;
+  const data = db.export();
+  fs.writeFileSync(dbPath, Buffer.from(data));
+};
+
+const ensureDir = () => {
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+};
+
+export const initDb = async () => {
+  if (db) {
+    return db;
+  }
+  ensureDir();
+  const SQL = await initSqlJs();
+  const fileExists = fs.existsSync(dbPath);
+  const fileBuffer = fileExists ? fs.readFileSync(dbPath) : undefined;
+  db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
+  db.exec("PRAGMA foreign_keys = ON;");
+  runMigrations();
+  persist();
+  return db;
+};
+
+const runMigrations = () => {
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+  );
+  const applied = all<{ id: number }>("SELECT id FROM migrations ORDER BY id").map((row) => row.id);
   for (const migration of migrations) {
     if (!applied.includes(migration.id)) {
       db.exec(migration.up);
-      db.prepare("INSERT INTO migrations (id) VALUES (?)").run(migration.id);
+      run("INSERT INTO migrations (id) VALUES (?)", [migration.id]);
     }
   }
+};
+
+const normalizeParams = (params?: SqlValue[] | Record<string, SqlValue>) => params ?? [];
+
+export const run = (sql: string, params?: SqlValue[] | Record<string, SqlValue>) => {
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
+  const stmt = db.prepare(sql);
+  stmt.run(normalizeParams(params));
+  stmt.free();
+  persist();
+};
+
+export const get = <T>(sql: string, params?: SqlValue[] | Record<string, SqlValue>) => {
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
+  const stmt = db.prepare(sql);
+  stmt.bind(normalizeParams(params));
+  const hasRow = stmt.step();
+  const row = hasRow ? (stmt.getAsObject() as T) : undefined;
+  stmt.free();
+  return row;
+};
+
+export const all = <T>(sql: string, params?: SqlValue[] | Record<string, SqlValue>) => {
+  if (!db) {
+    throw new Error("Database not initialized");
+  }
+  const stmt = db.prepare(sql);
+  stmt.bind(normalizeParams(params));
+  const rows: T[] = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject() as T);
+  }
+  stmt.free();
+  return rows;
+};
+
+export const insertAndGetId = (sql: string, params?: SqlValue[] | Record<string, SqlValue>) => {
+  run(sql, params);
+  const row = get<{ id: number }>("SELECT last_insert_rowid() as id");
+  if (!row) {
+    throw new Error("Failed to retrieve last insert id");
+  }
+  return row.id;
 };

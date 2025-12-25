@@ -4,12 +4,17 @@ import cors from "cors";
 import morgan from "morgan";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { db, runMigrations } from "./db";
+import { all, get, initDb, insertAndGetId, run } from "./db";
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 
-runMigrations();
+const boot = async () => {
+  await initDb();
+  app.listen(PORT, () => {
+    console.log(`API running on http://localhost:${PORT}`);
+  });
+};
 
 app.use(
   cors({
@@ -49,20 +54,21 @@ app.post(
       password: z.string().min(6)
     });
     const { email, password } = schema.parse(req.body);
-    const user = db
-      .prepare("SELECT id, email, password_hash, name FROM users WHERE email = ?")
-      .get(email);
+    const user = get<{ id: number; email: string; password_hash: string; name: string }>(
+      "SELECT id, email, password_hash, name FROM users WHERE email = ?",
+      [email]
+    );
 
     if (!user) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash as string);
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    req.session.userId = user.id as number;
+    req.session.userId = user.id;
     res.json({ data: { id: user.id, email: user.email, name: user.name } });
   })
 );
@@ -77,19 +83,18 @@ app.post("/api/auth/logout", requireAuth, (req, res) => {
 });
 
 app.get("/api/auth/me", requireAuth, (req, res) => {
-  const user = db
-    .prepare("SELECT id, email, name FROM users WHERE id = ?")
-    .get(req.session.userId as number);
+  const user = get<{ id: number; email: string; name: string }>(
+    "SELECT id, email, name FROM users WHERE id = ?",
+    [req.session.userId as number]
+  );
   res.json({ data: user });
 });
 
 app.get("/api/accounts", requireAuth, (req, res) => {
   const search = (req.query.search as string | undefined) ?? "";
   const accounts = search
-    ? db
-        .prepare("SELECT * FROM accounts WHERE name LIKE ? ORDER BY name")
-        .all(`%${search}%`)
-    : db.prepare("SELECT * FROM accounts ORDER BY name").all();
+    ? all("SELECT * FROM accounts WHERE name LIKE ? ORDER BY name", [`%${search}%`])
+    : all("SELECT * FROM accounts ORDER BY name");
   res.json({ data: accounts });
 });
 
@@ -105,13 +110,12 @@ app.post(
       address: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO accounts (name, industry, website, phone, address, created_at, updated_at)
-         VALUES (@name, @industry, @website, @phone, @address, datetime('now'), datetime('now'))`
-      )
-      .run(payload);
-    const account = db.prepare("SELECT * FROM accounts WHERE id = ?").get(result.lastInsertRowid);
+    const accountId = insertAndGetId(
+      `INSERT INTO accounts (name, industry, website, phone, address, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [payload.name, payload.industry, payload.website, payload.phone, payload.address]
+    );
+    const account = get("SELECT * FROM accounts WHERE id = ?", [accountId]);
     res.status(201).json({ data: account });
   })
 );
@@ -128,18 +132,19 @@ app.put(
       address: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    db.prepare(
+    run(
       `UPDATE accounts
-       SET name = @name, industry = @industry, website = @website, phone = @phone, address = @address, updated_at = datetime('now')
-       WHERE id = @id`
-    ).run({ ...payload, id: req.params.id });
-    const account = db.prepare("SELECT * FROM accounts WHERE id = ?").get(req.params.id);
+       SET name = ?, industry = ?, website = ?, phone = ?, address = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [payload.name, payload.industry, payload.website, payload.phone, payload.address, req.params.id]
+    );
+    const account = get("SELECT * FROM accounts WHERE id = ?", [req.params.id]);
     res.json({ data: account });
   })
 );
 
 app.delete("/api/accounts/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM accounts WHERE id = ?").run(req.params.id);
+  run("DELETE FROM accounts WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
@@ -161,7 +166,7 @@ app.get("/api/contacts", requireAuth, (req, res) => {
     query += ` WHERE ${filters.join(" AND ")}`;
   }
   query += " ORDER BY last_name";
-  const contacts = db.prepare(query).all(...params);
+  const contacts = all(query, params);
   res.json({ data: contacts });
 });
 
@@ -178,13 +183,19 @@ app.post(
       title: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO contacts (account_id, first_name, last_name, email, phone, title, created_at, updated_at)
-         VALUES (@account_id, @first_name, @last_name, @email, @phone, @title, datetime('now'), datetime('now'))`
-      )
-      .run(payload);
-    const contact = db.prepare("SELECT * FROM contacts WHERE id = ?").get(result.lastInsertRowid);
+    const contactId = insertAndGetId(
+      `INSERT INTO contacts (account_id, first_name, last_name, email, phone, title, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [
+        payload.account_id,
+        payload.first_name,
+        payload.last_name,
+        payload.email,
+        payload.phone,
+        payload.title
+      ]
+    );
+    const contact = get("SELECT * FROM contacts WHERE id = ?", [contactId]);
     res.status(201).json({ data: contact });
   })
 );
@@ -202,24 +213,33 @@ app.put(
       title: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    db.prepare(
+    run(
       `UPDATE contacts
-       SET account_id = @account_id, first_name = @first_name, last_name = @last_name,
-           email = @email, phone = @phone, title = @title, updated_at = datetime('now')
-       WHERE id = @id`
-    ).run({ ...payload, id: req.params.id });
-    const contact = db.prepare("SELECT * FROM contacts WHERE id = ?").get(req.params.id);
+       SET account_id = ?, first_name = ?, last_name = ?,
+           email = ?, phone = ?, title = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        payload.account_id,
+        payload.first_name,
+        payload.last_name,
+        payload.email,
+        payload.phone,
+        payload.title,
+        req.params.id
+      ]
+    );
+    const contact = get("SELECT * FROM contacts WHERE id = ?", [req.params.id]);
     res.json({ data: contact });
   })
 );
 
 app.delete("/api/contacts/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM contacts WHERE id = ?").run(req.params.id);
+  run("DELETE FROM contacts WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
-app.get("/api/stages", requireAuth, (req, res) => {
-  const stages = db.prepare("SELECT * FROM stages ORDER BY order_index").all();
+app.get("/api/stages", requireAuth, (_req, res) => {
+  const stages = all("SELECT * FROM stages ORDER BY order_index");
   res.json({ data: stages });
 });
 
@@ -234,12 +254,11 @@ app.post(
       is_lost: z.number().optional().default(0)
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO stages (name, order_index, is_won, is_lost) VALUES (@name, @order_index, @is_won, @is_lost)`
-      )
-      .run(payload);
-    const stage = db.prepare("SELECT * FROM stages WHERE id = ?").get(result.lastInsertRowid);
+    const stageId = insertAndGetId(
+      `INSERT INTO stages (name, order_index, is_won, is_lost) VALUES (?, ?, ?, ?)`,
+      [payload.name, payload.order_index, payload.is_won, payload.is_lost]
+    );
+    const stage = get("SELECT * FROM stages WHERE id = ?", [stageId]);
     res.status(201).json({ data: stage });
   })
 );
@@ -255,50 +274,54 @@ app.put(
       is_lost: z.number().optional().default(0)
     });
     const payload = schema.parse(req.body);
-    db.prepare(
-      `UPDATE stages SET name = @name, order_index = @order_index, is_won = @is_won, is_lost = @is_lost WHERE id = @id`
-    ).run({ ...payload, id: req.params.id });
-    const stage = db.prepare("SELECT * FROM stages WHERE id = ?").get(req.params.id);
+    run(`UPDATE stages SET name = ?, order_index = ?, is_won = ?, is_lost = ? WHERE id = ?`, [
+      payload.name,
+      payload.order_index,
+      payload.is_won,
+      payload.is_lost,
+      req.params.id
+    ]);
+    const stage = get("SELECT * FROM stages WHERE id = ?", [req.params.id]);
     res.json({ data: stage });
   })
 );
 
 app.delete("/api/stages/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM stages WHERE id = ?").run(req.params.id);
+  run("DELETE FROM stages WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
 app.get("/api/deals", requireAuth, (req, res) => {
   const { stage_id, owner_user_id, start_date, end_date, search } = req.query as Record<string, string>;
   const filters: string[] = [];
-  const params: Record<string, string> = {};
+  const params: Array<string> = [];
   if (stage_id) {
-    filters.push("stage_id = @stage_id");
-    params.stage_id = stage_id;
+    filters.push("stage_id = ?");
+    params.push(stage_id);
   }
   if (owner_user_id) {
-    filters.push("owner_user_id = @owner_user_id");
-    params.owner_user_id = owner_user_id;
+    filters.push("owner_user_id = ?");
+    params.push(owner_user_id);
   }
   if (start_date) {
-    filters.push("close_date >= @start_date");
-    params.start_date = start_date;
+    filters.push("close_date >= ?");
+    params.push(start_date);
   }
   if (end_date) {
-    filters.push("close_date <= @end_date");
-    params.end_date = end_date;
+    filters.push("close_date <= ?");
+    params.push(end_date);
   }
   if (search) {
-    filters.push("title LIKE @search");
-    params.search = `%${search}%`;
+    filters.push("title LIKE ?");
+    params.push(`%${search}%`);
   }
   const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
-  const deals = db.prepare(`SELECT * FROM deals ${where} ORDER BY updated_at DESC`).all(params);
+  const deals = all(`SELECT * FROM deals ${where} ORDER BY updated_at DESC`, params);
   res.json({ data: deals });
 });
 
 app.get("/api/deals/:id", requireAuth, (req, res) => {
-  const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id);
+  const deal = get("SELECT * FROM deals WHERE id = ?", [req.params.id]);
   if (!deal) {
     return res.status(404).json({ error: "Deal not found" });
   }
@@ -320,13 +343,21 @@ app.post(
       close_date: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO deals (account_id, primary_contact_id, title, amount, currency, stage_id, owner_user_id, close_date, created_at, updated_at)
-         VALUES (@account_id, @primary_contact_id, @title, @amount, @currency, @stage_id, @owner_user_id, @close_date, datetime('now'), datetime('now'))`
-      )
-      .run(payload);
-    const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(result.lastInsertRowid);
+    const dealId = insertAndGetId(
+      `INSERT INTO deals (account_id, primary_contact_id, title, amount, currency, stage_id, owner_user_id, close_date, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [
+        payload.account_id,
+        payload.primary_contact_id,
+        payload.title,
+        payload.amount,
+        payload.currency,
+        payload.stage_id,
+        payload.owner_user_id,
+        payload.close_date
+      ]
+    );
+    const deal = get("SELECT * FROM deals WHERE id = ?", [dealId]);
     res.status(201).json({ data: deal });
   })
 );
@@ -346,14 +377,25 @@ app.put(
       close_date: z.string().optional().nullable()
     });
     const payload = schema.parse(req.body);
-    db.prepare(
+    run(
       `UPDATE deals
-       SET account_id = @account_id, primary_contact_id = @primary_contact_id, title = @title,
-           amount = @amount, currency = @currency, stage_id = @stage_id,
-           owner_user_id = @owner_user_id, close_date = @close_date, updated_at = datetime('now')
-       WHERE id = @id`
-    ).run({ ...payload, id: req.params.id });
-    const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id);
+       SET account_id = ?, primary_contact_id = ?, title = ?,
+           amount = ?, currency = ?, stage_id = ?,
+           owner_user_id = ?, close_date = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        payload.account_id,
+        payload.primary_contact_id,
+        payload.title,
+        payload.amount,
+        payload.currency,
+        payload.stage_id,
+        payload.owner_user_id,
+        payload.close_date,
+        req.params.id
+      ]
+    );
+    const deal = get("SELECT * FROM deals WHERE id = ?", [req.params.id]);
     res.json({ data: deal });
   })
 );
@@ -364,23 +406,25 @@ app.patch(
   asyncHandler(async (req, res) => {
     const schema = z.object({ stage_id: z.number() });
     const payload = schema.parse(req.body);
-    db.prepare("UPDATE deals SET stage_id = ?, updated_at = datetime('now') WHERE id = ?").run(payload.stage_id, req.params.id);
-    const deal = db.prepare("SELECT * FROM deals WHERE id = ?").get(req.params.id);
+    run("UPDATE deals SET stage_id = ?, updated_at = datetime('now') WHERE id = ?", [
+      payload.stage_id,
+      req.params.id
+    ]);
+    const deal = get("SELECT * FROM deals WHERE id = ?", [req.params.id]);
     res.json({ data: deal });
   })
 );
 
 app.delete("/api/deals/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM deals WHERE id = ?").run(req.params.id);
+  run("DELETE FROM deals WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
 app.get("/api/activities", requireAuth, (req, res) => {
   const dealId = req.query.deal_id as string | undefined;
-  const stmt = dealId
-    ? db.prepare("SELECT * FROM activities WHERE deal_id = ? ORDER BY due_date")
-    : db.prepare("SELECT * FROM activities ORDER BY due_date");
-  const activities = dealId ? stmt.all(dealId) : stmt.all();
+  const activities = dealId
+    ? all("SELECT * FROM activities WHERE deal_id = ? ORDER BY due_date", [dealId])
+    : all("SELECT * FROM activities ORDER BY due_date");
   res.json({ data: activities });
 });
 
@@ -397,13 +441,19 @@ app.post(
       assigned_user_id: z.number()
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO activities (deal_id, type, subject, due_date, status, assigned_user_id, created_at, updated_at)
-         VALUES (@deal_id, @type, @subject, @due_date, @status, @assigned_user_id, datetime('now'), datetime('now'))`
-      )
-      .run(payload);
-    const activity = db.prepare("SELECT * FROM activities WHERE id = ?").get(result.lastInsertRowid);
+    const activityId = insertAndGetId(
+      `INSERT INTO activities (deal_id, type, subject, due_date, status, assigned_user_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [
+        payload.deal_id,
+        payload.type,
+        payload.subject,
+        payload.due_date,
+        payload.status,
+        payload.assigned_user_id
+      ]
+    );
+    const activity = get("SELECT * FROM activities WHERE id = ?", [activityId]);
     res.status(201).json({ data: activity });
   })
 );
@@ -421,28 +471,36 @@ app.put(
       assigned_user_id: z.number()
     });
     const payload = schema.parse(req.body);
-    db.prepare(
+    run(
       `UPDATE activities
-       SET deal_id = @deal_id, type = @type, subject = @subject, due_date = @due_date,
-           status = @status, assigned_user_id = @assigned_user_id, updated_at = datetime('now')
-       WHERE id = @id`
-    ).run({ ...payload, id: req.params.id });
-    const activity = db.prepare("SELECT * FROM activities WHERE id = ?").get(req.params.id);
+       SET deal_id = ?, type = ?, subject = ?, due_date = ?,
+           status = ?, assigned_user_id = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        payload.deal_id,
+        payload.type,
+        payload.subject,
+        payload.due_date,
+        payload.status,
+        payload.assigned_user_id,
+        req.params.id
+      ]
+    );
+    const activity = get("SELECT * FROM activities WHERE id = ?", [req.params.id]);
     res.json({ data: activity });
   })
 );
 
 app.delete("/api/activities/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM activities WHERE id = ?").run(req.params.id);
+  run("DELETE FROM activities WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
 app.get("/api/notes", requireAuth, (req, res) => {
   const dealId = req.query.deal_id as string | undefined;
-  const stmt = dealId
-    ? db.prepare("SELECT * FROM notes WHERE deal_id = ? ORDER BY created_at DESC")
-    : db.prepare("SELECT * FROM notes ORDER BY created_at DESC");
-  const notes = dealId ? stmt.all(dealId) : stmt.all();
+  const notes = dealId
+    ? all("SELECT * FROM notes WHERE deal_id = ? ORDER BY created_at DESC", [dealId])
+    : all("SELECT * FROM notes ORDER BY created_at DESC");
   res.json({ data: notes });
 });
 
@@ -456,19 +514,18 @@ app.post(
       body: z.string().min(1)
     });
     const payload = schema.parse(req.body);
-    const result = db
-      .prepare(
-        `INSERT INTO notes (deal_id, author_user_id, body, created_at)
-         VALUES (@deal_id, @author_user_id, @body, datetime('now'))`
-      )
-      .run(payload);
-    const note = db.prepare("SELECT * FROM notes WHERE id = ?").get(result.lastInsertRowid);
+    const noteId = insertAndGetId(
+      `INSERT INTO notes (deal_id, author_user_id, body, created_at)
+       VALUES (?, ?, ?, datetime('now'))`,
+      [payload.deal_id, payload.author_user_id, payload.body]
+    );
+    const note = get("SELECT * FROM notes WHERE id = ?", [noteId]);
     res.status(201).json({ data: note });
   })
 );
 
 app.delete("/api/notes/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM notes WHERE id = ?").run(req.params.id);
+  run("DELETE FROM notes WHERE id = ?", [req.params.id]);
   res.json({ data: { success: true } });
 });
 
@@ -480,6 +537,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   res.status(500).json({ error: "Server error" });
 });
 
-app.listen(PORT, () => {
-  console.log(`API running on http://localhost:${PORT}`);
+boot().catch((err) => {
+  console.error("Failed to initialize database", err);
+  process.exit(1);
 });
