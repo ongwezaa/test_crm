@@ -5,3 +5,5 @@ declare module "express-session" {
     userId?: number;
   }
 }
+
+declare module "sql.js";
